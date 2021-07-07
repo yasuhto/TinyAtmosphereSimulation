@@ -4,4 +4,4 @@
 - Blue is a downdraft
 
 #### Tiny AtmosphereSimulation
-![Tiny AtmosphereSimulation](./Media/TinyAtmosphereSim.PNG)
+![Tiny AtmosphereSimulation](./Media/TinyAtmosphereSim.png)
