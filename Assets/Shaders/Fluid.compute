@@ -1,0 +1,171 @@
+﻿#include "./Assets/Shaders/CommonConfig.cginc"
+#include "./Assets/Shaders/CommonTypes.cginc"
+
+#pragma kernel ApplyAdvection
+#pragma kernel ApplyAdvectionVelocity
+#pragma kernel CalcVorticity
+#pragma kernel ApplyConfinement
+#pragma kernel CalcDivergence
+#pragma kernel CalcPressure
+#pragma kernel UpdateVelocity
+
+float4 _Dissipate;
+float _Forward;
+float _Epsilon;
+
+Texture3D<float4> _Vorticity;
+Texture3D<float4> _Divergence;
+Texture3D<float4> _Pressure;
+Texture3D<float4> _Obstacles;
+
+
+//  移流元のグリッド座標を返します
+inline float3 CalcAdvectedId(uint3 id)
+{
+    //  NOTE: velocity(m/s) m -> km 変換 x0.001
+    //        p-velocity Pa -> hPa x0.01
+
+    float3 velocity = SampleTexture(_Velocity, id, 0).xyz;
+    float3 prevId = id - velocity * _InverseGridSize * _Forward * _DeltaTime * float3 (0.001, 0.01, 0.001);
+
+    return prevId;
+}
+
+[numthreads(NUM_THREADS_X, NUM_THREADS_Y, NUM_THREADS_Z)]
+void ApplyAdvection(uint3 id : SV_DispatchThreadId)
+{
+    float3 aid = CalcAdvectedId(id);
+    float4 A = SampleTexture(_Read, aid, 0) * _Dissipate;
+
+    //  HACK:wは標高なので移流させない
+    _Write[id] = lerp(float4(A.xyz, _Read[id].w), float4(0, 0, 0, 0), _Obstacles[id].x);
+}
+
+[numthreads(NUM_THREADS_X, NUM_THREADS_Y, NUM_THREADS_Z)]
+void ApplyAdvectionVelocity(uint3 id : SV_DispatchThreadId)
+{
+    float3 aid = CalcAdvectedId(id);
+    float4 A = SampleTexture(_Read, aid, 0) * _Dissipate;
+
+    _Write[id] = lerp(A, float4(0, 0, 0, 0), _Obstacles[id].x);
+}
+
+[numthreads(NUM_THREADS_X, NUM_THREADS_Y, NUM_THREADS_Z)]
+void CalcVorticity(int3 id : SV_DispatchThreadId)
+{
+    float4 L = SampleTexture(_Velocity, id, int3(-1, 0, 0));
+    float4 R = SampleTexture(_Velocity, id, int3(1, 0, 0));
+    float4 B = SampleTexture(_Velocity, id, int3(0, -1, 0));
+    float4 T = SampleTexture(_Velocity, id, int3(0, 1, 0));
+    float4 D = SampleTexture(_Velocity, id, int3(0, 0, -1));
+    float4 U = SampleTexture(_Velocity, id, int3(0, 0, 1));
+
+    float3 vorticity = 0.5 * float3(((T.z - B.z) - (U.y - D.y)), ((U.x - D.x) - (R.z - L.z)), ((R.y - L.y) - (T.x - B.x)));
+    _Write[id] = float4(vorticity, 0);
+}
+
+[numthreads(NUM_THREADS_X, NUM_THREADS_Y, NUM_THREADS_Z)]
+void ApplyConfinement(int3 id : SV_DispatchThreadId)
+{
+    //  NOTE: vorticity(m/s?) m -> km 変換 x0.001
+
+    float omegaL = length(SampleTexture(_Vorticity, id, int3(-1, 0, 0)));
+    float omegaR = length(SampleTexture(_Vorticity, id, int3(1, 0, 0)));
+    float omegaB = length(SampleTexture(_Vorticity, id, int3(0, -1, 0)));
+    float omegaT = length(SampleTexture(_Vorticity, id, int3(0, 1, 0)));
+    float omegaD = length(SampleTexture(_Vorticity, id, int3(0, 0, -1)));
+    float omegaU = length(SampleTexture(_Vorticity, id, int3(0, 0, 1)));
+
+    float4 omega = _Vorticity[id];
+    float3 eta = 0.5 * float3(omegaR - omegaL, omegaT - omegaB, omegaU - omegaD);
+    eta = normalize(eta + float3(0.001, 0.001, 0.001));
+    float4 force = _DeltaTime * _Epsilon * float4(eta.y * omega.z - eta.z * omega.y, eta.z * omega.x - eta.x * omega.z, eta.x * omega.y - eta.y * omega.x, 0);
+
+    _Write[id] = _Read[id] + force * 0.001;
+}
+
+[numthreads(NUM_THREADS_X, NUM_THREADS_Y, NUM_THREADS_Z)]
+void CalcDivergence(int3 id : SV_DispatchThreadId)
+{
+    float4 L = SampleTexture(_Velocity, id, int3(-1, 0, 0));
+    float4 R = SampleTexture(_Velocity, id, int3(1, 0, 0));
+    float4 B = SampleTexture(_Velocity, id, int3(0, -1, 0));
+    float4 T = SampleTexture(_Velocity, id, int3(0, 1, 0));
+    float4 D = SampleTexture(_Velocity, id, int3(0, 0, -1));
+    float4 U = SampleTexture(_Velocity, id, int3(0, 0, 1));
+    float4 C = float4(0, 0, 0, 0);
+
+    L = lerp(L, C, SampleTexture(_Obstacles, id, int3(-1, 0, 0)).x);
+    R = lerp(R, C, SampleTexture(_Obstacles, id, int3(1, 0, 0)).x);
+    B = lerp(B, C, SampleTexture(_Obstacles, id, int3(0, -1, 0)).x);
+    T = lerp(T, C, SampleTexture(_Obstacles, id, int3(0, 1, 0)).x);
+    D = lerp(D, C, SampleTexture(_Obstacles, id, int3(0, 0, -1)).x);
+    U = lerp(U, C, SampleTexture(_Obstacles, id, int3(0, 0, 1)).x);
+
+    //  空間中心差分法
+    float divergence = 0.5 *
+        ((R.x - L.x) * _InverseGridSize.x
+            + (T.y - B.y) * _InverseGridSize.y
+            + (U.z - D.z) * _InverseGridSize.z);
+
+    _Write[id] = float4(divergence, 0, 0, 0);
+}
+
+[numthreads(NUM_THREADS_X, NUM_THREADS_Y, NUM_THREADS_Z)]
+void CalcPressure(int3 id : SV_DispatchThreadId)
+{
+    float4 L = SampleTexture(_Pressure, id, int3(-1, 0, 0));
+    float4 R = SampleTexture(_Pressure, id, int3(1, 0, 0));
+    float4 B = SampleTexture(_Pressure, id, int3(0, -1, 0));
+    float4 T = SampleTexture(_Pressure, id, int3(0, 1, 0));
+    float4 D = SampleTexture(_Pressure, id, int3(0, 0, -1));
+    float4 U = SampleTexture(_Pressure, id, int3(0, 0, 1));
+	float4 C = _Pressure[id];
+
+    L = lerp(L, C, SampleTexture(_Obstacles, id, int3(-1, 0, 0)).x);
+    R = lerp(R, C, SampleTexture(_Obstacles, id, int3(1, 0, 0)).x);
+    B = lerp(B, C, SampleTexture(_Obstacles, id, int3(0, -1, 0)).x);
+    T = lerp(T, C, SampleTexture(_Obstacles, id, int3(0, 1, 0)).x);
+    D = lerp(D, C, SampleTexture(_Obstacles, id, int3(0, 0, -1)).x);
+    U = lerp(U, C, SampleTexture(_Obstacles, id, int3(0, 0, 1)).x);
+
+	float4 divergence = _Divergence[id];
+	_Write[id] = (L + R + B + T + U + D - divergence) / 6.0;
+}
+
+[numthreads(NUM_THREADS_X, NUM_THREADS_Y, NUM_THREADS_Z)]
+void UpdateVelocity(int3 id : SV_DispatchThreadId)
+{
+    float4 L = SampleTexture(_Pressure, id, int3(-1, 0, 0));
+    float4 R = SampleTexture(_Pressure, id, int3(1, 0, 0));
+    float4 B = SampleTexture(_Pressure, id, int3(0, -1, 0));
+    float4 T = SampleTexture(_Pressure, id, int3(0, 1, 0));
+    float4 D = SampleTexture(_Pressure, id, int3(0, 0, -1));
+    float4 U = SampleTexture(_Pressure, id, int3(0, 0, 1));
+    float4 C = _Pressure[id];
+
+    float4 oL = SampleTexture(_Obstacles, id, int3(-1, 0, 0));
+    float4 oR = SampleTexture(_Obstacles, id, int3(1, 0, 0));
+    float4 oB = SampleTexture(_Obstacles, id, int3(0, -1, 0));
+    float4 oT = SampleTexture(_Obstacles, id, int3(0, 1, 0));
+    float4 oD = SampleTexture(_Obstacles, id, int3(0, 0, -1));
+    float4 oU = SampleTexture(_Obstacles, id, int3(0, 0, 1));
+
+    L = lerp(L, C, oL.x);
+    R = lerp(R, C, oR.x);
+    B = lerp(B, C, oB.x);
+    T = lerp(T, C, oT.x);
+    D = lerp(D, C, oD.x);
+    U = lerp(U, C, oU.x);
+
+    float4 mask = float4(1, 1, 1, 1);
+    mask.x = step(oL.x, 0.1);
+    mask.x = step(oR.x, 0.1);
+    mask.y = step(oB.x, 0.1);
+    mask.y = step(oT.x, 0.1);
+    mask.z = step(oD.x, 0.1);
+    mask.z = step(oU.x, 0.1);
+
+    float4 v = _Velocity[id] - float4(R.x - L.x, T.x - B.x, U.x - D.x, 0) * 0.5;
+    _Write[id] = v * mask;
+}

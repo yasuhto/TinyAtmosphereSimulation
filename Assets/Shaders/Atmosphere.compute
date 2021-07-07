@@ -1,0 +1,37 @@
+﻿#include "./Assets/Shaders/CommonConfig.cginc"
+#include "./Assets/Shaders/CommonTypes.cginc"
+#include "./Assets/Shaders/DynamicProcess.cginc"
+
+#pragma kernel Initialize
+#pragma kernel CalcDynamicProcess
+#pragma kernel CalcPhysicalProcess
+
+[numthreads(NUM_THREADS_X, NUM_THREADS_Y, NUM_THREADS_Z)]
+void Initialize(uint3 id : SV_DispatchThreadID)
+{
+}
+
+[numthreads(NUM_THREADS_X, NUM_THREADS_Y, NUM_THREADS_Z)]
+void CalcDynamicProcess(uint3 id : SV_DispatchThreadID)
+{
+    _Write[id] = float4(_Velocity[id].xyz + _DeltaTime * CalcForce(id, _Atmosphere, _Velocity[id].xyz), 0);
+}
+
+[numthreads(NUM_THREADS_X, NUM_THREADS_Y, NUM_THREADS_Z)]
+void CalcPhysicalProcess(uint3 id : SV_DispatchThreadID)
+{
+    float2 latlng = GetLatLng(id);
+    float dT = sin((90 - latlng.y) * Deg2Rad);
+    //  地表だけ加熱
+    dT = lerp(0, dT, step(1, id.y) - step(2, id.y));
+    //  p座標毎の標高値
+    float altitude = 0;
+    for (uint i = 0; i < id.y; i++)
+    {
+        altitude += 0.001 * CalcDeltaAltitudeWithTemperature(_Atmosphere[int3(id.x, i, id.z)].x); // m -> km
+    }
+
+    _Write[id] = float4(_Atmosphere[id].x + dT, _Atmosphere[id].yz, abs(altitude));
+
+    GenerateDebugData(id);
+}
